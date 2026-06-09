@@ -1,0 +1,18 @@
+{
+  "name": "kazap-backend",
+  "version": "1.0.0",
+  "description": "Backend Node.js pour KAZAP — webhooks Twilio + Firebase",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "firebase-admin": "^12.0.0",
+    "twilio": "^5.0.0",
+    "dotenv": "^16.4.5"
+  }
+}
