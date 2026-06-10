@@ -1,12 +1,9 @@
 /**
- * KAZAP — Backend VoIP (Africa's Talking + Twilio)
- * Déployer sur Render, Railway, ou Fly.io
+ * KAZAP — Backend VoIP Twilio
  *
- * Variables d'environnement requises :
- *   AT_API_KEY      → clé Africa's Talking
- *   AT_USERNAME     → sandbox
+ * Variables d'environnement requises sur Render :
  *   FIREBASE_ADMIN_KEY → contenu JSON de firebase-admin-key.json (sur 1 ligne)
- *   BACKEND_URL     → https://kazap-backend.onrender.com
+ *   BACKEND_URL        → https://kazap-backend1.onrender.com
  */
 
 const express = require('express');
@@ -14,184 +11,179 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// ── Africa's Talking SDK ────────────────────────────────────────
-const AfricasTalking = require('africastalking');
-const atClient = AfricasTalking({
-  apiKey:   process.env.AT_API_KEY   || "atsk_1dbffddaa8e91ee0fcd35aaa76d586d4ec3a5b16b2887d55659b0c42cfad16d327861b0e",
-  username: process.env.AT_USERNAME  || "sandbox"
-});
-const atVoice = atClient.VOICE;
-
 // ── Firebase Admin ──────────────────────────────────────────────
 const admin = require('firebase-admin');
-
 const serviceAccount = JSON.parse(process.env.FIREBASE_ADMIN_KEY);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-
 const db = admin.firestore();
 
 // ── Health check ────────────────────────────────────────────────
-app.get('/', (req, res) => res.json({ status: 'ok', service: 'Kazap VoIP Backend' }));
+app.get('/', (req, res) => res.send('Kazap backend OK'));
 
 // ════════════════════════════════════════════════════════════════
-// AFRICA'S TALKING — VOICE WEBHOOK
-// Configurer dans AT Dashboard :
-//   Voice → Sandbox App → Voice Callback URL
-//   → https://VOTRE_URL/webhooks/voice/:vendorId
-// ════════════════════════════════════════════════════════════════
-app.post('/webhooks/voice/:vendorId', async (req, res) => {
-  const { vendorId } = req.params;
-  const { isActive, callerNumber, sessionId, dtmfDigits, callSessionState } = req.body;
-
-  console.log(`[AT Voice] vendorId=${vendorId} caller=${callerNumber} session=${sessionId} state=${callSessionState}`);
-
-  try {
-    // Récupérer les données du vendor depuis Firestore
-    const vendorSnap = await db.collection('vendors').doc(vendorId).get();
-    if (!vendorSnap.exists) {
-      return res.set('Content-Type', 'text/xml').send(`
-        <Response>
-          <Say>Ce numéro n'est pas configuré. Au revoir.</Say>
-        </Response>
-      `);
-    }
-    const vendor = vendorSnap.data();
-
-    // ── Enregistrer l'appel dans Firestore ───────────────────
-    await db.collection('voip_calls').add({
-      vendorId,
-      callerNumber: callerNumber || 'unknown',
-      sessionId,
-      provider: 'africas_talking',
-      dtmfDigits: dtmfDigits || null,
-      callSessionState: callSessionState || null,
-      iaHandled: !!vendor?.voip?.unavailableMode,
-      startedAt: admin.firestore.FieldValue.serverTimestamp()
-    });
-
-    // ── Vendor disponible → transférer l'appel ───────────────
-    if (!vendor?.voip?.unavailableMode) {
-      const realNumber = vendor.voip?.number || vendor.phone;
-      if (!realNumber) {
-        return res.set('Content-Type', 'text/xml').send(`
-          <Response><Say>Le correspondant est momentanément indisponible.</Say></Response>
-        `);
-      }
-      return res.set('Content-Type', 'text/xml').send(`
-        <Response>
-          <Dial phoneNumbers="${realNumber}" record="true" />
-        </Response>
-      `);
-    }
-
-    // ── Mode Indisponible → L'IA prend l'appel ───────────────
-    const boutiqueName = vendor.boutiqueName || 'notre boutique';
-    const welcomeMsg   = vendor.settings?.iaWelcomeMsg
-      || `Bonjour et bienvenue chez ${boutiqueName}. Notre assistant IA vous répond.`;
-
-    return res.set('Content-Type', 'text/xml').send(`
-      <Response>
-        <Say voice="en-US-Wavenet-A" playBeep="false">${escapeXml(welcomeMsg)}</Say>
-        <GetDigits timeout="30" numDigits="1"
-          callbackUrl="${process.env.BACKEND_URL || ''}/webhooks/voice/${vendorId}/digits">
-          <Say>Appuyez sur 1 pour connaître nos horaires, 2 pour passer une commande, ou restez en ligne.</Say>
-        </GetDigits>
-        <Say>Nous n'avons pas reçu votre choix. Merci de rappeler. Au revoir.</Say>
-      </Response>
-    `);
-
-  } catch (err) {
-    console.error('[AT Voice] Erreur :', err);
-    return res.set('Content-Type', 'text/xml').send(`
-      <Response><Say>Une erreur technique s'est produite. Merci de rappeler.</Say></Response>
-    `);
-  }
-});
-
-// ── Traitement des touches DTMF ─────────────────────────────────
-app.post('/webhooks/voice/:vendorId/digits', async (req, res) => {
-  const { vendorId } = req.params;
-  const { dtmfDigits, callerNumber } = req.body;
-
-  console.log(`[AT Digits] vendorId=${vendorId} digit=${dtmfDigits} caller=${callerNumber}`);
-
-  try {
-    const vendorSnap = await db.collection('vendors').doc(vendorId).get();
-    const vendor = vendorSnap.data() || {};
-
-    if (dtmfDigits === '1') {
-      const ranges = vendor.settings?.availabilityRanges || [
-        { start: '09:00', end: '12:00' },
-        { start: '14:00', end: '18:00' }
-      ];
-      const horaireMsg = `Nos horaires sont : matin de ${ranges[0]?.start} à ${ranges[0]?.end}` +
-        (ranges[1] ? `, et après-midi de ${ranges[1].start} à ${ranges[1].end}` : '') + '. Au revoir.';
-      return res.set('Content-Type', 'text/xml').send(`
-        <Response><Say>${escapeXml(horaireMsg)}</Say></Response>
-      `);
-    }
-
-    if (dtmfDigits === '2') {
-      return res.set('Content-Type', 'text/xml').send(`
-        <Response>
-          <Say>Pour passer une commande, veuillez nous envoyer un message WhatsApp ou rappeler pendant nos heures d'ouverture. Au revoir.</Say>
-        </Response>
-      `);
-    }
-
-    return res.set('Content-Type', 'text/xml').send(`
-      <Response><Say>Choix non reconnu. Au revoir.</Say></Response>
-    `);
-  } catch (err) {
-    console.error('[AT Digits] Erreur :', err);
-    return res.set('Content-Type', 'text/xml').send(`
-      <Response><Say>Erreur technique. Au revoir.</Say></Response>
-    `);
-  }
-});
-
-// ════════════════════════════════════════════════════════════════
-// TWILIO — VOICE WEBHOOK (optionnel)
+// TWILIO — APPEL ENTRANT
+// Configurer dans Twilio Console :
+//   Phone Number → Voice → Webhook URL
+//   → https://kazap-backend1.onrender.com/webhooks/twilio/VENDOR_ID
 // ════════════════════════════════════════════════════════════════
 app.post('/webhooks/twilio/:vendorId', async (req, res) => {
   const { vendorId } = req.params;
-  const { From: callerNumber, CallSid: sessionId } = req.body;
+  const callerNumber = req.body.From || 'unknown';
+  const sessionId    = req.body.CallSid || '';
+
+  console.log(`[Twilio] vendorId=${vendorId} caller=${callerNumber} sid=${sessionId}`);
 
   try {
+    // Récupérer les données du vendor dans Firestore
     const vendorSnap = await db.collection('vendors').doc(vendorId).get();
-    const vendor = vendorSnap.data() || {};
 
+    if (!vendorSnap.exists) {
+      return res.set('Content-Type', 'text/xml').send(`
+        <Response>
+          <Say language="fr-FR">Ce numéro n'est pas configuré. Au revoir.</Say>
+        </Response>
+      `);
+    }
+
+    const vendor = vendorSnap.data();
+
+    // Enregistrer l'appel dans Firestore (collection voip_calls)
     await db.collection('voip_calls').add({
-      vendorId, callerNumber, sessionId,
+      vendorId,
+      callerNumber,
+      sessionId,
       provider: 'twilio',
       iaHandled: !!vendor?.voip?.unavailableMode,
       startedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
+    // ── Vendor DISPONIBLE → transférer l'appel sur son vrai numéro ──
     if (!vendor?.voip?.unavailableMode) {
-      return res.set('Content-Type', 'text/xml').send(
-        `<Response><Dial>${vendor.phone}</Dial></Response>`
-      );
+      const realNumber = vendor?.voip?.number || vendor?.phone;
+      if (!realNumber) {
+        return res.set('Content-Type', 'text/xml').send(`
+          <Response>
+            <Say language="fr-FR">Le correspondant est momentanément indisponible. Au revoir.</Say>
+          </Response>
+        `);
+      }
+      return res.set('Content-Type', 'text/xml').send(`
+        <Response>
+          <Dial>${escapeXml(realNumber)}</Dial>
+        </Response>
+      `);
     }
 
-    const welcomeMsg = vendor.settings?.iaWelcomeMsg || 'Bonjour, notre assistant virtuel vous répond.';
+    // ── Vendor INDISPONIBLE → L'IA prend l'appel ─────────────────
+    const boutiqueName = vendor?.boutiqueName || 'notre boutique';
+    const welcomeMsg   = vendor?.settings?.iaWelcomeMsg
+      || `Bonjour et bienvenue chez ${boutiqueName}. Notre assistant virtuel vous répond.`;
+
+    const backendUrl = process.env.BACKEND_URL || '';
+
     return res.set('Content-Type', 'text/xml').send(`
       <Response>
         <Say language="fr-FR">${escapeXml(welcomeMsg)}</Say>
-        <Gather numDigits="1" action="/webhooks/twilio/${vendorId}/gather">
-          <Say language="fr-FR">Tapez 1 pour les horaires, 2 pour une commande.</Say>
+        <Gather numDigits="1" action="${backendUrl}/webhooks/twilio/${vendorId}/gather" method="POST" timeout="10">
+          <Say language="fr-FR">Appuyez sur 1 pour connaître nos horaires, ou sur 2 pour laisser un message.</Say>
         </Gather>
+        <Say language="fr-FR">Nous n'avons pas reçu votre choix. Merci de rappeler. Au revoir.</Say>
       </Response>
     `);
+
   } catch (err) {
     console.error('[Twilio] Erreur :', err);
-    return res.set('Content-Type', 'text/xml').send(
-      `<Response><Say language="fr-FR">Erreur technique.</Say></Response>`
-    );
+    return res.set('Content-Type', 'text/xml').send(`
+      <Response>
+        <Say language="fr-FR">Une erreur technique s'est produite. Merci de rappeler.</Say>
+      </Response>
+    `);
   }
 });
 
-// ── Helpers ─────────────────────────────────────────────────────
+// ── Traitement du choix DTMF ────────────────────────────────────
+app.post('/webhooks/twilio/:vendorId/gather', async (req, res) => {
+  const { vendorId } = req.params;
+  const digit = req.body.Digits;
+
+  console.log(`[Twilio Gather] vendorId=${vendorId} digit=${digit}`);
+
+  try {
+    const vendorSnap = await db.collection('vendors').doc(vendorId).get();
+    const vendor = vendorSnap.data() || {};
+
+    // Touche 1 → Horaires
+    if (digit === '1') {
+      const ranges = vendor?.settings?.availabilityRanges || [
+        { start: '09:00', end: '12:00' },
+        { start: '14:00', end: '18:00' }
+      ];
+      const msg = `Nos horaires sont : matin de ${ranges[0]?.start} à ${ranges[0]?.end}` +
+        (ranges[1] ? `, et après-midi de ${ranges[1].start} à ${ranges[1].end}` : '') +
+        '. Au revoir.';
+      return res.set('Content-Type', 'text/xml').send(`
+        <Response>
+          <Say language="fr-FR">${escapeXml(msg)}</Say>
+        </Response>
+      `);
+    }
+
+    // Touche 2 → Laisser un message vocal
+    if (digit === '2') {
+      const backendUrl = process.env.BACKEND_URL || '';
+      return res.set('Content-Type', 'text/xml').send(`
+        <Response>
+          <Say language="fr-FR">Vous pouvez laisser votre message après le bip. Appuyez sur dièse pour terminer.</Say>
+          <Record maxLength="60" finishOnKey="#" action="${backendUrl}/webhooks/twilio/${vendorId}/recording" />
+          <Say language="fr-FR">Message enregistré. Merci et au revoir.</Say>
+        </Response>
+      `);
+    }
+
+    // Choix non reconnu
+    return res.set('Content-Type', 'text/xml').send(`
+      <Response>
+        <Say language="fr-FR">Choix non reconnu. Au revoir.</Say>
+      </Response>
+    `);
+
+  } catch (err) {
+    console.error('[Twilio Gather] Erreur :', err);
+    return res.set('Content-Type', 'text/xml').send(`
+      <Response>
+        <Say language="fr-FR">Erreur technique. Au revoir.</Say>
+      </Response>
+    `);
+  }
+});
+
+// ── Sauvegarde du message vocal ─────────────────────────────────
+app.post('/webhooks/twilio/:vendorId/recording', async (req, res) => {
+  const { vendorId } = req.params;
+  const recordingUrl = req.body.RecordingUrl;
+  const callerNumber = req.body.From || req.body.Caller || 'unknown';
+
+  console.log(`[Twilio Recording] vendorId=${vendorId} url=${recordingUrl}`);
+
+  try {
+    await db.collection('voip_recordings').add({
+      vendorId,
+      callerNumber,
+      recordingUrl,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+  } catch (err) {
+    console.error('[Twilio Recording] Erreur Firestore :', err);
+  }
+
+  return res.set('Content-Type', 'text/xml').send(`
+    <Response>
+      <Say language="fr-FR">Merci. Au revoir.</Say>
+    </Response>
+  `);
+});
+
+// ── Helper ──────────────────────────────────────────────────────
 function escapeXml(str) {
   return String(str)
     .replace(/&/g, '&amp;')
@@ -200,6 +192,6 @@ function escapeXml(str) {
     .replace(/"/g, '&quot;');
 }
 
-// ── Start server ────────────────────────────────────────────────
+// ── Start ────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Kazap VoIP backend running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Kazap backend running on port ${PORT}`));
