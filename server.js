@@ -3,7 +3,7 @@
  *
  * Variables d'environnement requises sur Render :
  *   FIREBASE_ADMIN_KEY → contenu JSON de firebase-admin-key.json (sur 1 ligne)
- *   BACKEND_URL        → https://kazap-backend1.onrender.com
+ *   BACKEND_URL        → https://kazap-backend.onrender.com
  */
 
 const express = require('express');
@@ -22,9 +22,6 @@ app.get('/', (req, res) => res.send('Kazap backend OK'));
 
 // ════════════════════════════════════════════════════════════════
 // TWILIO — APPEL ENTRANT
-// Configurer dans Twilio Console :
-//   Phone Number → Voice → Webhook URL
-//   → https://kazap-backend1.onrender.com/webhooks/twilio/VENDOR_ID
 // ════════════════════════════════════════════════════════════════
 app.post('/webhooks/twilio/:vendorId', async (req, res) => {
   const { vendorId } = req.params;
@@ -34,7 +31,6 @@ app.post('/webhooks/twilio/:vendorId', async (req, res) => {
   console.log(`[Twilio] vendorId=${vendorId} caller=${callerNumber} sid=${sessionId}`);
 
   try {
-    // Récupérer les données du vendor dans Firestore
     const vendorSnap = await db.collection('vendors').doc(vendorId).get();
 
     if (!vendorSnap.exists) {
@@ -47,7 +43,7 @@ app.post('/webhooks/twilio/:vendorId', async (req, res) => {
 
     const vendor = vendorSnap.data();
 
-    // Enregistrer l'appel dans Firestore (collection voip_calls)
+    // Enregistrer l'appel dans Firestore
     await db.collection('voip_calls').add({
       vendorId,
       callerNumber,
@@ -57,9 +53,14 @@ app.post('/webhooks/twilio/:vendorId', async (req, res) => {
       startedAt: admin.firestore.FieldValue.serverTimestamp()
     });
 
-    // ── Vendor DISPONIBLE → transférer l'appel sur son vrai numéro ──
+    // ── Vendor DISPONIBLE → transférer l'appel ──────────────────
     if (!vendor?.voip?.unavailableMode) {
-      const realNumber = vendor?.voip?.number || vendor?.phone;
+      const realNumber = vendor?.voip?.twilioForwardNumber
+                      || vendor?.voip?.forwardNumber
+                      || vendor?.phone;
+
+      console.log(`[Twilio] Mode disponible → transfert vers ${realNumber}`);
+
       if (!realNumber) {
         return res.set('Content-Type', 'text/xml').send(`
           <Response>
@@ -69,12 +70,14 @@ app.post('/webhooks/twilio/:vendorId', async (req, res) => {
       }
       return res.set('Content-Type', 'text/xml').send(`
         <Response>
-          <Dial>${escapeXml(realNumber)}</Dial>
+          <Dial timeout="20" action="${process.env.BACKEND_URL}/webhooks/twilio/${vendorId}/no-answer">
+            <Number>${escapeXml(realNumber)}</Number>
+          </Dial>
         </Response>
       `);
     }
 
-    // ── Vendor INDISPONIBLE → L'IA prend l'appel ─────────────────
+    // ── Vendor INDISPONIBLE → L'IA prend l'appel ────────────────
     const boutiqueName = vendor?.boutiqueName || 'notre boutique';
     const welcomeMsg   = vendor?.settings?.iaWelcomeMsg
       || `Bonjour et bienvenue chez ${boutiqueName}. Notre assistant virtuel vous répond.`;
@@ -99,6 +102,20 @@ app.post('/webhooks/twilio/:vendorId', async (req, res) => {
       </Response>
     `);
   }
+});
+
+// ── Appel sans réponse (timeout transfert) ──────────────────────
+app.post('/webhooks/twilio/:vendorId/no-answer', async (req, res) => {
+  const { vendorId } = req.params;
+  const dialStatus = req.body.DialCallStatus || '';
+
+  console.log(`[Twilio No-Answer] vendorId=${vendorId} dialStatus=${dialStatus}`);
+
+  return res.set('Content-Type', 'text/xml').send(`
+    <Response>
+      <Say language="fr-FR">Le correspondant n'est pas disponible pour le moment. Merci de rappeler ultérieurement. Au revoir.</Say>
+    </Response>
+  `);
 });
 
 // ── Traitement du choix DTMF ────────────────────────────────────
