@@ -14,6 +14,10 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
+// ── CORS ────────────────────────────────────────────────────────
+const cors = require('cors');
+app.use(cors());
+
 // ── Firebase Admin ──────────────────────────────────────────────
 const admin = require('firebase-admin');
 const serviceAccount = JSON.parse(process.env.FIREBASE_ADMIN_KEY);
