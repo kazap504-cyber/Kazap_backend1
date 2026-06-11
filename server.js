@@ -1,5 +1,5 @@
 /**
- * KAZAP — Backend VoIP Twilio + OTP SMS
+ * KAZAP — Backend VoIP Twilio + OTP SMS + FCM Push Notifications
  *
  * Variables d'environnement requises sur Render :
  *   FIREBASE_ADMIN_KEY  → contenu JSON de firebase-admin-key.json (sur 1 ligne)
@@ -315,6 +315,213 @@ function escapeXml(str) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;');
 }
+
+// ════════════════════════════════════════════════════════════════
+// FCM — PUSH NOTIFICATIONS (Firebase Cloud Messaging)
+// ════════════════════════════════════════════════════════════════
+
+/**
+ * POST /api/save-fcm-token
+ * Reçoit le FCM token du client (envoyé depuis le navigateur)
+ * et le sauvegarde dans Firestore pour pouvoir envoyer des push notifications
+ *
+ * Body: { vendorId, token }
+ */
+app.post('/api/save-fcm-token', async (req, res) => {
+  const { vendorId, token } = req.body;
+
+  if (!vendorId || !token) {
+    return res.status(400).json({
+      error: 'Paramètres manquants : vendorId et token requis'
+    });
+  }
+
+  try {
+    // Mettre à jour le document vendor avec le nouveau token FCM
+    await db.collection('vendors').doc(vendorId).update({
+      fcmToken: token,
+      fcmTokenUpdatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    console.log(`✅ FCM token sauvegardé pour vendor ${vendorId}`);
+    return res.json({
+      success: true,
+      message: 'FCM token enregistré avec succès'
+    });
+  } catch (error) {
+    console.error('[FCM Save Token] Erreur :', error);
+    return res.status(500).json({
+      error: `Erreur serveur : ${error.message}`
+    });
+  }
+});
+
+/**
+ * Fonction utilitaire: sendFCMPush(vendorId, title, body, data)
+ * Envoie une notification push FCM au vendor
+ *
+ * Exemple d'utilisation:
+ *   await sendFCMPush(vendorId, "🛒 Nouvelle commande !", "Alice — 5 000 FCFA", {
+ *     type: "order",
+ *     tag: "kazap-orders",
+ *     clickUrl: "/dashboard?section=commandes"
+ *   });
+ */
+async function sendFCMPush(vendorId, title, body, data = {}) {
+  try {
+    // Récupérer le vendor et son FCM token
+    const vendorDoc = await db.collection('vendors').doc(vendorId).get();
+
+    if (!vendorDoc.exists) {
+      console.warn(`⚠️ Vendor ${vendorId} introuvable`);
+      return null;
+    }
+
+    const token = vendorDoc.data()?.fcmToken;
+    if (!token) {
+      console.warn(`⚠️ Aucun FCM token pour vendor ${vendorId}. Notifications push non disponibles.`);
+      return null;
+    }
+
+    // Construire le message FCM
+    const message = {
+      token,
+      notification: {
+        title,
+        body
+      },
+      data,
+      webpush: {
+        notification: {
+          icon: 'https://votre-domaine.com/icons/icon-192x192.png',
+          badge: 'https://votre-domaine.com/icons/icon-72x72.png',
+          vibrate: [200, 100, 200]
+        }
+      }
+    };
+
+    // Envoyer via Firebase Admin Messaging
+    const messageId = await admin.messaging().send(message);
+    console.log(`✅ Push FCM envoyée (messageId: ${messageId}) → vendor ${vendorId}`);
+    return messageId;
+  } catch (error) {
+    console.error(`❌ Erreur sendFCMPush pour vendor ${vendorId} :`, error.message);
+    return null;
+  }
+}
+
+/**
+ * GET /test-fcm/:vendorId
+ * Endpoint de test — envoie une notification push de test au vendor
+ *
+ * Exemple: GET https://kazap-backend1.onrender.com/test-fcm/USER_ID
+ */
+app.get('/test-fcm/:vendorId', async (req, res) => {
+  const vendorId = req.params.vendorId;
+
+  if (!vendorId) {
+    return res.status(400).json({ error: 'vendorId requis' });
+  }
+
+  const messageId = await sendFCMPush(
+    vendorId,
+    '🧪 Test FCM',
+    'Ceci est un message de test — si vous le lisez, FCM fonctionne ! ✅'
+  );
+
+  res.json({
+    success: !!messageId,
+    messageId,
+    message: messageId
+      ? 'Notification envoyée avec succès'
+      : 'Erreur ou aucun token FCM disponible'
+  });
+});
+
+// ════════════════════════════════════════════════════════════════
+// EXEMPLES D'UTILISATION FCM (à ajouter dans vos routes)
+// ════════════════════════════════════════════════════════════════
+
+/*
+ * EXEMPLE 1: Envoyer une notification push lors d'une NOUVELLE COMMANDE
+ * À ajouter dans votre route POST /orders ou équivalent :
+ *
+ * app.post('/orders', async (req, res) => {
+ *   // ... votre logique de création de commande ...
+ *   const newOrder = {
+ *     id: orderRef.id,
+ *     vendorId: req.body.vendorId,
+ *     clientName: req.body.clientName,
+ *     clientPhone: req.body.clientPhone,
+ *     total: req.body.total,
+ *     status: 'pending',
+ *     createdAt: admin.firestore.FieldValue.serverTimestamp()
+ *   };
+ *
+ *   // Envoyer la push notification au vendor
+ *   await sendFCMPush(
+ *     newOrder.vendorId,
+ *     '🛒 Nouvelle commande !',
+ *     `${newOrder.clientName || 'Un client'} vient de passer une commande — ${Number(newOrder.total).toLocaleString('fr-FR')} FCFA`,
+ *     {
+ *       type: 'order',
+ *       tag: 'kazap-orders',
+ *       clickUrl: '/dashboard?section=commandes'
+ *     }
+ *   );
+ *
+ *   res.json({ success: true, order: newOrder });
+ * });
+ */
+
+/*
+ * EXEMPLE 2: Envoyer une notification push lors d'un NOUVEAU RDV
+ * À ajouter dans votre route POST /appointments ou équivalent :
+ *
+ * app.post('/appointments', async (req, res) => {
+ *   // ... votre logique de création de RDV ...
+ *   const newAppt = {
+ *     id: apptRef.id,
+ *     vendorId: req.body.vendorId,
+ *     clientName: req.body.clientName,
+ *     date: req.body.date,
+ *     time: req.body.time,
+ *     status: 'pending',
+ *     createdAt: admin.firestore.FieldValue.serverTimestamp()
+ *   };
+ *
+ *   // Envoyer la push notification au vendor
+ *   await sendFCMPush(
+ *     newAppt.vendorId,
+ *     '📅 Nouveau rendez-vous !',
+ *     `${newAppt.clientName || 'Un client'} a pris RDV pour le ${newAppt.date} à ${newAppt.time}`,
+ *     {
+ *       type: 'rdv',
+ *       tag: 'kazap-appointments',
+ *       clickUrl: '/dashboard?section=agenda'
+ *     }
+ *   );
+ *
+ *   res.json({ success: true, appointment: newAppt });
+ * });
+ */
+
+/*
+ * EXEMPLE 3: Lister les FCM tokens sauvegardés (DEBUG)
+ * GET /debug/fcm-tokens
+ *
+ * app.get('/debug/fcm-tokens', async (req, res) => {
+ *   const vendorSnap = await db.collection('vendors').get();
+ *   const tokens = [];
+ *   vendorSnap.forEach(doc => {
+ *     const token = doc.data().fcmToken;
+ *     if (token) {
+ *       tokens.push({ vendorId: doc.id, token: token.substring(0, 50) + '...' });
+ *     }
+ *   });
+ *   res.json({ total: tokens.length, tokens });
+ * });
+ */
 
 // ── Start ────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
