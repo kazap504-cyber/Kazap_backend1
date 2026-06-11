@@ -1,9 +1,12 @@
 /**
- * KAZAP — Backend VoIP Twilio
+ * KAZAP — Backend VoIP Twilio + OTP SMS
  *
  * Variables d'environnement requises sur Render :
- *   FIREBASE_ADMIN_KEY → contenu JSON de firebase-admin-key.json (sur 1 ligne)
- *   BACKEND_URL        → https://kazap-backend.onrender.com
+ *   FIREBASE_ADMIN_KEY  → contenu JSON de firebase-admin-key.json (sur 1 ligne)
+ *   BACKEND_URL         → https://kazap-backend.onrender.com
+ *   TWILIO_ACCOUNT_SID  → Account SID Twilio (commence par AC...)
+ *   TWILIO_AUTH_TOKEN   → Auth Token Twilio
+ *   TWILIO_PHONE_NUMBER → Numéro Twilio au format E.164 (ex: +22961000000)
  */
 
 const express = require('express');
@@ -17,8 +20,108 @@ const serviceAccount = JSON.parse(process.env.FIREBASE_ADMIN_KEY);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
 
+// ── Twilio Client (VoIP + OTP SMS) ─────────────────────────────
+const twilio = require('twilio');
+const twilioClient = twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+
 // ── Health check ────────────────────────────────────────────────
 app.get('/', (req, res) => res.send('Kazap backend OK'));
+
+// ════════════════════════════════════════════════════════════════
+// SMS — Envoi de messages (commandes, notifications, rappels RDV)
+// ════════════════════════════════════════════════════════════════
+app.post('/sms/send', async (req, res) => {
+  const { vendorId, to, message } = req.body;
+  if (!vendorId || !to || !message) {
+    return res.status(400).json({ error: 'vendorId, to et message sont requis' });
+  }
+
+  try {
+    const vendorSnap = await db.collection('vendors').doc(vendorId).get();
+    if (!vendorSnap.exists) {
+      return res.status(404).json({ error: 'Vendor introuvable' });
+    }
+
+    const vendor = vendorSnap.data();
+    const fromNumber = vendor?.voip?.twilioPhoneNumber
+                    || process.env.TWILIO_PHONE_NUMBER;
+
+    if (!fromNumber) {
+      return res.status(400).json({ error: 'Numéro Twilio non configuré' });
+    }
+
+    const result = await twilioClient.messages.create({
+      body: message,
+      from: fromNumber,
+      to
+    });
+
+    return res.json({ success: true, sid: result.sid });
+  } catch (err) {
+    console.error('[SMS Send] Erreur :', err);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════
+// OTP — Envoi et vérification par SMS (Twilio)
+// ════════════════════════════════════════════════════════════════
+
+app.post('/otp/send', async (req, res) => {
+  const { phone } = req.body;
+  if (!phone) return res.status(400).json({ error: 'Numéro requis' });
+
+  const code = String(Math.floor(1000 + Math.random() * 9000));
+  const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+  const key = 'otp_' + phone.replace(/\D/g, '');
+
+  try {
+    // Stocker le code dans Firestore
+    await db.collection('otp_codes').doc(key).set({
+      code, expiresAt, phone,
+      createdAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // Envoyer le SMS via Twilio
+    await twilioClient.messages.create({
+      body: `Votre code KAZAP : ${code} (valable 10 min)`,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      to: phone
+    });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('[OTP Send] Erreur :', err);
+    return res.status(500).json({ error: 'Erreur envoi OTP : ' + err.message });
+  }
+});
+
+app.post('/otp/verify', async (req, res) => {
+  const { phone, code } = req.body;
+  if (!phone || !code) return res.status(400).json({ error: 'Données manquantes' });
+
+  const key = 'otp_' + phone.replace(/\D/g, '');
+
+  try {
+    const snap = await db.collection('otp_codes').doc(key).get();
+    if (!snap.exists) return res.status(400).json({ error: 'Code OTP introuvable. Renvoyez un nouveau code.' });
+
+    const data = snap.data();
+    if (Date.now() > data.expiresAt) return res.status(400).json({ error: 'Code OTP expiré. Renvoyez un nouveau code.' });
+    if (data.code !== code) return res.status(400).json({ error: 'Code OTP incorrect.' });
+
+    // Supprimer après vérification réussie
+    await db.collection('otp_codes').doc(key).delete();
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('[OTP Verify] Erreur :', err);
+    return res.status(500).json({ error: 'Erreur vérification OTP : ' + err.message });
+  }
+});
 
 // ════════════════════════════════════════════════════════════════
 // TWILIO — APPEL ENTRANT
