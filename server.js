@@ -7,6 +7,9 @@
  *   TWILIO_ACCOUNT_SID  → Account SID Twilio (commence par AC...)
  *   TWILIO_AUTH_TOKEN   → Auth Token Twilio
  *   TWILIO_PHONE_NUMBER → Numéro Twilio au format E.164 (ex: +22961000000)
+ *   TWILIO_API_KEY      → API Key SID (commence par SK...) — TACHE #02
+ *   TWILIO_API_SECRET   → API Key Secret — TACHE #02
+ *   TWILIO_APP_SID      → TwiML App SID (commence par AP...) — TACHE #02
  */
 
 const express = require('express');
@@ -128,7 +131,111 @@ app.post('/otp/verify', async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════
-// TWILIO — APPEL ENTRANT
+// TACHE #02 — VOIP TWILIO CLIENT JS
+// Permet au navigateur client (boutique publique) de passer
+// des appels VoIP via Twilio sans plugin.
+// ════════════════════════════════════════════════════════════════
+
+const AccessToken = twilio.jwt.AccessToken;
+const VoiceGrant = AccessToken.VoiceGrant;
+const VoiceResponse = twilio.twiml.VoiceResponse;
+
+/**
+ * GET /api/voip/token?shopSlug=xxx
+ * Génère un AccessToken JWT Twilio avec VoiceGrant.
+ * Appelé par le SDK Twilio Client JS dans la boutique publique.
+ * Token valable 1 heure.
+ */
+app.get('/api/voip/token', (req, res) => {
+  const shopSlug = req.query.shopSlug || 'default';
+
+  try {
+    const token = new AccessToken(
+      process.env.TWILIO_ACCOUNT_SID,
+      process.env.TWILIO_API_KEY,
+      process.env.TWILIO_API_SECRET,
+      { identity: `client-${shopSlug}-${Date.now()}`, ttl: 3600 }
+    );
+
+    const voiceGrant = new VoiceGrant({
+      outgoingApplicationSid: process.env.TWILIO_APP_SID,
+      incomingAllow: false,
+    });
+    token.addGrant(voiceGrant);
+
+    console.log(`[VoIP Token] Token généré pour shopSlug=${shopSlug}`);
+    return res.json({ token: token.toJwt() });
+  } catch (err) {
+    console.error('[VoIP Token] Erreur :', err);
+    return res.status(500).json({ error: 'Erreur génération token VoIP : ' + err.message });
+  }
+});
+
+/**
+ * POST /api/voip/incoming-call
+ * Webhook TwiML appelé par Twilio quand un appel VoIP est initié
+ * depuis le navigateur client (Twilio.Device.connect()).
+ * Doit répondre en < 5 secondes.
+ * Route l'appel vers le numéro IA / numéro de la boutique.
+ */
+app.post('/api/voip/incoming-call', async (req, res) => {
+  const shopSlug = req.body.shopSlug || req.query.shopSlug || '';
+  const callSid  = req.body.CallSid || '';
+
+  console.log(`[VoIP Incoming] shopSlug=${shopSlug} callSid=${callSid}`);
+
+  const twiml = new VoiceResponse();
+
+  try {
+    // Optionnel : récupérer les infos de la boutique via le slug
+    let forwardNumber = process.env.TWILIO_PHONE_NUMBER;
+
+    if (shopSlug) {
+      const q = await db.collection('vendors')
+        .where('boutiqueSlug', '==', shopSlug)
+        .limit(1)
+        .get();
+
+      if (!q.empty) {
+        const vendor = q.docs[0].data();
+        // Utiliser le numéro de transfert VoIP configuré par le vendor, sinon fallback
+        forwardNumber = vendor?.voip?.twilioForwardNumber
+                     || vendor?.voip?.number
+                     || vendor?.phone
+                     || forwardNumber;
+
+        // Enregistrer l'appel VoIP entrant dans Firestore
+        await db.collection('voip_calls').add({
+          vendorId: q.docs[0].id,
+          shopSlug,
+          callSid,
+          type: 'voip_client',
+          startedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+      }
+    }
+
+    // Message d'accueil vocal puis transfert vers l'IA / le numéro
+    twiml.say(
+      { language: 'fr-FR', voice: 'Polly.Celine' },
+      'Bonjour, bienvenue sur KAZAP. Un instant, je vous mets en relation avec notre assistant.'
+    );
+    twiml.dial(escapeXml(forwardNumber));
+
+  } catch (err) {
+    console.error('[VoIP Incoming] Erreur :', err);
+    twiml.say(
+      { language: 'fr-FR' },
+      'Une erreur technique s\'est produite. Merci de rappeler.'
+    );
+  }
+
+  res.set('Content-Type', 'text/xml');
+  return res.send(twiml.toString());
+});
+
+// ════════════════════════════════════════════════════════════════
+// TWILIO — APPEL ENTRANT (webhook numéro physique)
 // ════════════════════════════════════════════════════════════════
 app.post('/webhooks/twilio/:vendorId', async (req, res) => {
   const { vendorId } = req.params;
@@ -359,17 +466,9 @@ app.post('/api/save-fcm-token', async (req, res) => {
 /**
  * Fonction utilitaire: sendFCMPush(vendorId, title, body, data)
  * Envoie une notification push FCM au vendor
- *
- * Exemple d'utilisation:
- *   await sendFCMPush(vendorId, "🛒 Nouvelle commande !", "Alice — 5 000 FCFA", {
- *     type: "order",
- *     tag: "kazap-orders",
- *     clickUrl: "/dashboard?section=commandes"
- *   });
  */
 async function sendFCMPush(vendorId, title, body, data = {}) {
   try {
-    // Récupérer le vendor et son FCM token
     const vendorDoc = await db.collection('vendors').doc(vendorId).get();
 
     if (!vendorDoc.exists) {
@@ -383,13 +482,9 @@ async function sendFCMPush(vendorId, title, body, data = {}) {
       return null;
     }
 
-    // Construire le message FCM
     const message = {
       token,
-      notification: {
-        title,
-        body
-      },
+      notification: { title, body },
       data,
       webpush: {
         notification: {
@@ -400,7 +495,6 @@ async function sendFCMPush(vendorId, title, body, data = {}) {
       }
     };
 
-    // Envoyer via Firebase Admin Messaging
     const messageId = await admin.messaging().send(message);
     console.log(`✅ Push FCM envoyée (messageId: ${messageId}) → vendor ${vendorId}`);
     return messageId;
@@ -413,8 +507,6 @@ async function sendFCMPush(vendorId, title, body, data = {}) {
 /**
  * GET /test-fcm/:vendorId
  * Endpoint de test — envoie une notification push de test au vendor
- *
- * Exemple: GET https://kazap-backend1.onrender.com/test-fcm/USER_ID
  */
 app.get('/test-fcm/:vendorId', async (req, res) => {
   const vendorId = req.params.vendorId;
@@ -444,82 +536,31 @@ app.get('/test-fcm/:vendorId', async (req, res) => {
 
 /*
  * EXEMPLE 1: Envoyer une notification push lors d'une NOUVELLE COMMANDE
- * À ajouter dans votre route POST /orders ou équivalent :
  *
  * app.post('/orders', async (req, res) => {
  *   // ... votre logique de création de commande ...
- *   const newOrder = {
- *     id: orderRef.id,
- *     vendorId: req.body.vendorId,
- *     clientName: req.body.clientName,
- *     clientPhone: req.body.clientPhone,
- *     total: req.body.total,
- *     status: 'pending',
- *     createdAt: admin.firestore.FieldValue.serverTimestamp()
- *   };
- *
- *   // Envoyer la push notification au vendor
  *   await sendFCMPush(
  *     newOrder.vendorId,
  *     '🛒 Nouvelle commande !',
  *     `${newOrder.clientName || 'Un client'} vient de passer une commande — ${Number(newOrder.total).toLocaleString('fr-FR')} FCFA`,
- *     {
- *       type: 'order',
- *       tag: 'kazap-orders',
- *       clickUrl: '/dashboard?section=commandes'
- *     }
+ *     { type: 'order', tag: 'kazap-orders', clickUrl: '/dashboard?section=commandes' }
  *   );
- *
  *   res.json({ success: true, order: newOrder });
  * });
  */
 
 /*
  * EXEMPLE 2: Envoyer une notification push lors d'un NOUVEAU RDV
- * À ajouter dans votre route POST /appointments ou équivalent :
  *
  * app.post('/appointments', async (req, res) => {
  *   // ... votre logique de création de RDV ...
- *   const newAppt = {
- *     id: apptRef.id,
- *     vendorId: req.body.vendorId,
- *     clientName: req.body.clientName,
- *     date: req.body.date,
- *     time: req.body.time,
- *     status: 'pending',
- *     createdAt: admin.firestore.FieldValue.serverTimestamp()
- *   };
- *
- *   // Envoyer la push notification au vendor
  *   await sendFCMPush(
  *     newAppt.vendorId,
  *     '📅 Nouveau rendez-vous !',
  *     `${newAppt.clientName || 'Un client'} a pris RDV pour le ${newAppt.date} à ${newAppt.time}`,
- *     {
- *       type: 'rdv',
- *       tag: 'kazap-appointments',
- *       clickUrl: '/dashboard?section=agenda'
- *     }
+ *     { type: 'rdv', tag: 'kazap-appointments', clickUrl: '/dashboard?section=agenda' }
  *   );
- *
  *   res.json({ success: true, appointment: newAppt });
- * });
- */
-
-/*
- * EXEMPLE 3: Lister les FCM tokens sauvegardés (DEBUG)
- * GET /debug/fcm-tokens
- *
- * app.get('/debug/fcm-tokens', async (req, res) => {
- *   const vendorSnap = await db.collection('vendors').get();
- *   const tokens = [];
- *   vendorSnap.forEach(doc => {
- *     const token = doc.data().fcmToken;
- *     if (token) {
- *       tokens.push({ vendorId: doc.id, token: token.substring(0, 50) + '...' });
- *     }
- *   });
- *   res.json({ total: tokens.length, tokens });
  * });
  */
 
