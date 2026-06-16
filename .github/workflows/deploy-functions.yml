@@ -1,0 +1,40 @@
+name: Deploy Firebase Cloud Functions
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "functions/**"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Install Firebase CLI
+        run: npm install -g firebase-tools
+
+      - name: Install Functions dependencies
+        run: cd functions && npm install
+
+      - name: Set Twilio config
+        run: |
+          npx firebase functions:config:set \
+            twilio.account_sid="${{ secrets.TWILIO_ACCOUNT_SID }}" \
+            twilio.auth_token="${{ secrets.TWILIO_AUTH_TOKEN }}" \
+            twilio.from_number="${{ secrets.TWILIO_FROM_NUMBER }}" \
+            --project kazap-f8ff6 --token "${{ secrets.FIREBASE_TOKEN }}"
+
+      - name: Deploy Cloud Functions
+        run: |
+          npx firebase deploy --only functions:onNewVendorRegistered \
+            --project kazap-f8ff6 --token "${{ secrets.FIREBASE_TOKEN }}"
