@@ -1,6 +1,7 @@
 name: Deploy Firebase Cloud Functions
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - main
@@ -9,7 +10,8 @@ on:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest
+    runs-on:
+  workflow_dispatch: ubuntu-latest
 
     steps:
       - name: Checkout code
@@ -18,7 +20,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "18"
+          node-version:
+  workflow_dispatch: "18"
 
       - name: Install Firebase CLI
         run: npm install -g firebase-tools
