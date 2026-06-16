@@ -430,4 +430,5 @@ router.get('/status/:orderId', async (req, res) => {
 
 module.exports = router;
 module.exports.updateOrderPaymentStatus = updateOrderPaymentStatus;
-module.exports.PAYMENT_STATUS           = PAYMENT_STATUS;
+module.exports.PAYMENT_STATUS    
+= PAYMENT_STATUS;
